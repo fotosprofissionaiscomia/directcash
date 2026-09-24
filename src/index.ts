@@ -1,3 +1,4 @@
+import {BlockError} from './map';
 import {mediaFormat} from './media-format';
 
 
@@ -18,7 +19,7 @@ export default {
 async function handle(req:Request,env:AppEnv,ctx:ExecutionContext):Promise<Response>{
   const url=new URL(req.url),path=url.pathname;
   if(path.startsWith('/uploads/')){
-    const id=path.slice('/uploads/'.length);if(!/^[a-f0-9-]{36}\.(jpg|png|webp|mp4|m4a|mp3|wav|ogg)$/.test(id)||!['GET','HEAD'].includes(req.method)||!env.FLOW_MEDIA)return new Response(null,{status:404});
+    const id=path.slice('/uploads/'.length);if(!/^[a-f0-9-]{36}\.(jpg|png|webp|mp4|m4a|mp3|wav|ogg|aac|pdf|doc|docx)$/.test(id)||!['GET','HEAD'].includes(req.method)||!env.FLOW_MEDIA)return new Response(null,{status:404});
     return env.FLOW_MEDIA.getByName(id).fetch(req);
   }
   if(!path.startsWith('/api/')&&!path.startsWith('/oauth/')&&path!=='/webhook')return env.ASSETS.fetch(req);
@@ -98,7 +99,7 @@ async function handle(req:Request,env:AppEnv,ctx:ExecutionContext):Promise<Respo
       const existing=await account(env);if(existing&&existing.id!==a.id&&!row.add_account)return json({error:'Para manter a conta atual, use Conectar outra conta no menu lateral.'},409);
       env=await registerProfile(env,a);
       await env.DB.prepare('INSERT INTO account(id,username,token,expires,refreshed) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET username=excluded.username,token=excluded.token,expires=excluded.expires,refreshed=excluded.refreshed').bind(a.id,a.username,a.token,a.expires,a.refreshed).run();
-      try{await graph(env,a,a.id+'/subscribed_apps',{subscribed_fields:['comments','messages']});await log(env,'connection','Instagram conectado. Faça um teste real para confirmar o webhook.');}catch{await log(env,'connection','Conta conectada, mas a assinatura do webhook falhou. Use Verificar conexão.');}
+      try{await graph(env,a,a.id+'/subscribed_apps',{subscribed_fields:['comments','messages','messaging_postbacks']});await log(env,'connection','Instagram conectado. Faça um teste real para confirmar o webhook.');}catch{await log(env,'connection','Conta conectada, mas a assinatura do webhook falhou. Use Verificar conexão.');}
       return new Response(null,{status:302,headers:{Location:url.origin+'/?connection=ok#setup','Set-Cookie':profileCookie(a.id)}});
     }catch{await log(env,'connection','Conexão falhou. Confira o aplicativo, a URL de retorno e as permissões na Meta.');return Response.redirect(url.origin+'/?connection=error#setup',302);}
   }
@@ -107,17 +108,17 @@ async function handle(req:Request,env:AppEnv,ctx:ExecutionContext):Promise<Respo
   }
   if(path==='/api/diagnose'&&req.method==='POST'){
     const a=await account(env);if(!a)return json({error:'Conecte seu Instagram.'},400);
-    try{await graph(env,a,'me?fields=user_id,username');await graph(env,a,a.id+'/subscribed_apps',{subscribed_fields:['comments','messages']});return json({message:'Token aceito e conta inscrita em comentários e mensagens. Agora faça um comentário de teste; isso confirma o webhook completo.'});}catch{return json({error:'A Meta recusou a verificação. Confira as permissões e reconecte sua conta.'},400);}
+    try{await graph(env,a,'me?fields=user_id,username');await graph(env,a,a.id+'/subscribed_apps',{subscribed_fields:['comments','messages','messaging_postbacks']});return json({message:'Token aceito e conta inscrita em comentários e mensagens. Agora faça um comentário de teste; isso confirma o webhook completo.'});}catch{return json({error:'A Meta recusou a verificação. Confira as permissões e reconecte sua conta.'},400);}
   }
   if(path.startsWith('/api/media/')&&req.method==='GET'){
     const id=path.slice('/api/media/'.length);if(!/^\d{1,40}$/.test(id))return json({error:'Publicação inválida.'},400);
     const a=await account(env);if(!a)return json({error:'Conecte o Instagram primeiro.'},400);
-    try{return json(await graph(env,a,id+'?fields=id,caption,permalink,media_type,media_url,thumbnail_url'));}catch{return json({error:'Não foi possível carregar a prévia da publicação.'},400);}
+    try{return json(await graph(env,a,id+'?fields=id,caption,permalink,media_type,media_url,thumbnail_url,timestamp'));}catch{return json({error:'Não foi possível carregar a prévia da publicação.'},400);}
   }
   if(path==='/api/media'&&req.method==='GET'){
     const a=await account(env);if(!a)return json({error:'Conecte o Instagram primeiro.'},400);
     const after=url.searchParams.get('after')||'';if(after.length>1000)return json({},400);
-    try{const data=await graph(env,a,`${a.id}/media?fields=id,caption,permalink,media_type,media_url,thumbnail_url&limit=25${after?'&after='+encodeURIComponent(after):''}`);return json({data:data.data||[],after:data.paging?.next?data.paging?.cursors?.after:null});}catch{return json({error:'Não foi possível listar os posts. Confira a conexão.'},400);}
+    try{const data=await graph(env,a,`${a.id}/media?fields=id,caption,permalink,media_type,media_url,thumbnail_url,timestamp&limit=25${after?'&after='+encodeURIComponent(after):''}`);return json({data:data.data||[],after:data.paging?.next?data.paging?.cursors?.after:null});}catch{return json({error:'Não foi possível listar os posts. Confira a conexão.'},400);}
   }
   if(path==='/api/stories'&&req.method==='GET'){
     const a=await account(env);if(!a)return json({error:'Conecte o Instagram primeiro.'},400);
@@ -125,10 +126,13 @@ async function handle(req:Request,env:AppEnv,ctx:ExecutionContext):Promise<Respo
   }
   if(path==='/api/rules'&&req.method==='GET')return json((await env.DB.prepare('SELECT * FROM rules ORDER BY created DESC').all()).results);
   if(path==='/api/rules'&&req.method==='POST'){
-    let r;const b=await body(req);try{r=validateRule(b);}catch(e){return json({error:(e as Error).message},400);}
+    let r;const b=await body(req);try{r=validateRule(b);}catch(e){return json({error:(e as Error).message,...(e instanceof BlockError?{nodeId:e.nodeId,blockNumber:e.blockNumber}:{})},400);}
     const a=await account(env);
     if(r.active&&!a)return json({error:'Nenhum Instagram conectado neste perfil. Abra Configuração e conecte sua conta.'},400);
     if(r.active&&a&&!await licenseFor(env,a.id))return json({error:'O Instagram está conectado, mas o acesso não está liberado. Ative a licença ou confira TEST_ACCESS_UNTIL nas variáveis do Worker após a última implantação.'},400);
+    if(r.active&&a&&JSON.parse(r.flow||'{}').map?.nodes?.some((n:any)=>n.replyStyle==='buttons'&&n.choices?.length)){
+      try{await graph(env,a,a.id+'/subscribed_apps',{subscribed_fields:['comments','messages','messaging_postbacks']});}catch{return json({error:'Não foi possível ativar os cliques dos botões no Instagram. Confira messaging_postbacks nos webhooks do app e use Verificar conexão. Seu fluxo ainda não foi alterado.'},400);}
+    }
     const id=typeof b.id==='string'?b.id:crypto.randomUUID();if(!/^[a-f0-9-]{36}$/.test(id))return json({},400);
     const count=await env.DB.prepare('SELECT count(*) n FROM rules').first<{n:number}>();if((count?.n||0)>=30&&!b.id)return json({error:'Limite desta edição: 30 automações. Edite ou exclua uma existente.'},400);
     await env.DB.prepare('INSERT INTO rules(id,name,trigger,media_id,keywords,message,link,public_reply,active,created,flow) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,trigger=excluded.trigger,media_id=excluded.media_id,keywords=excluded.keywords,message=excluded.message,link=excluded.link,public_reply=excluded.public_reply,active=excluded.active,flow=excluded.flow').bind(id,r.name,r.trigger,r.media_id,r.keywords,r.message,r.link,r.public_reply,r.active,now(),r.flow||'{}').run();return json({id});
@@ -136,7 +140,7 @@ async function handle(req:Request,env:AppEnv,ctx:ExecutionContext):Promise<Respo
   if(path.startsWith('/api/rules/')&&req.method==='DELETE'){await env.DB.prepare('DELETE FROM rules WHERE id=?').bind(path.split('/').pop()).run();return json({ok:true});}
   if(path==='/api/contacts'&&req.method==='GET')return json((await env.DB.prepare("SELECT c.user_id,c.name,c.email,c.created,c.updated,(SELECT group_concat(tag, ', ') FROM contact_tags t WHERE t.user_id=c.user_id AND t.account_id=c.account_id) tags FROM contacts c UNION SELECT t.user_id,'','',min(t.created),max(t.created),group_concat(t.tag, ', ') FROM contact_tags t WHERE NOT EXISTS(SELECT 1 FROM contacts c WHERE c.user_id=t.user_id AND c.account_id=t.account_id) GROUP BY t.user_id ORDER BY updated DESC LIMIT 1000").all()).results);
   if(path.startsWith('/api/contacts/')&&req.method==='DELETE'){const uid=decodeURIComponent(path.split('/').pop()!);await env.DB.batch([env.DB.prepare('DELETE FROM contacts WHERE user_id=?').bind(uid),env.DB.prepare('DELETE FROM contact_tags WHERE user_id=?').bind(uid),env.DB.prepare('DELETE FROM conversations WHERE user_id=?').bind(uid),env.DB.prepare("UPDATE jobs SET status='cancelled' WHERE recipient=? AND status='pending'").bind(uid)]);return json({ok:true});}
-  if(path==='/api/activity'&&req.method==='GET')return json({jobs:(await env.DB.prepare('SELECT j.id,j.kind,j.status,j.created,j.updated,j.detail,j.text,j.payload,j.recipient,COALESCE(c.user_id,j.recipient) AS user_id FROM jobs j LEFT JOIN conversations c ON c.id=j.conversation_id ORDER BY j.created DESC LIMIT 50').all()).results,events:(await env.DB.prepare('SELECT kind,detail,created FROM events ORDER BY created DESC,id DESC LIMIT 100').all()).results});
+  if(path==='/api/activity'&&req.method==='GET')return json({jobs:(await env.DB.prepare("SELECT j.id,j.kind,j.status,j.created,j.updated,j.detail,j.text,j.payload,j.recipient,j.rule_id,j.phase AS node_id,COALESCE(c.user_id,j.recipient) AS user_id,(SELECT COALESCE(json_extract(n.value,'$.number'),CAST(n.key AS INTEGER)+1) FROM json_each(c.config,'$.map.nodes') n WHERE json_extract(n.value,'$.id')=j.phase LIMIT 1) AS block_number FROM jobs j LEFT JOIN conversations c ON c.id=j.conversation_id ORDER BY j.created DESC LIMIT 50").all()).results,events:(await env.DB.prepare('SELECT kind,detail,created FROM events ORDER BY created DESC,id DESC LIMIT 100').all()).results});
   return json({error:'Rota não encontrada.'},404);
 }
 
